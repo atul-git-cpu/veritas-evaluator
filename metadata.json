@@ -1,0 +1,5 @@
+{
+  "name": "Veritas AI Evaluator",
+  "description": "Production-grade AI hallucination detection and grounding engine with drift detection and recommended fixes.",
+  "requestFramePermissions": []
+}
