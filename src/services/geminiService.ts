@@ -1,6 +1,3 @@
-import { GoogleGenAI } from "@google/genai";
-import { EVAL_SCHEMA, EvaluationResponse } from "../types";
-
 const SYSTEM_INSTRUCTION = `You are an AI Output Evaluation Engine designed to assess the reliability of AI-generated responses.
 
 Step 1 — Claim Extraction: Decompose the AI response into atomic factual claims.
@@ -25,134 +22,142 @@ For every claim that is NOT status = SUPPORTED:
 
 PLAIN ENGLISH SUMMARY RULE:
 Always populate plain_english_summary inside risk_analysis.
-  - Write 2–3 sentences maximum.
+  - Write 2-3 sentences maximum.
   - Use no technical terms.
   - State what is wrong, how serious it is, and what the reviewer should do.
   - Write for a product manager, not an engineer.`;
 
-const INLINE_SIZE_LIMIT = 20 * 1024 * 1024; // 20 MB
-const MAX_PDF_SIZE = 50 * 1024 * 1024; // 50 MB
+export default async function handler(req, res) {
+  if (req.method !== "POST") {
+    return res.status(405).json({ error: "Method not allowed" });
+  }
 
-function fileToBase64(file: File): Promise<string> {
-  return new Promise((resolve, reject) => {
-    const reader = new FileReader();
-    reader.onload = () => resolve((reader.result as string).split(",")[1]);
-    reader.onerror = () => reject(new Error("File read failed"));
-    reader.readAsDataURL(file);
-  });
-}
+  const apiKey = process.env.GEMINI_API_KEY;
+  if (!apiKey) {
+    return res.status(500).json({ error: "GEMINI_API_KEY not configured on server" });
+  }
 
-async function uploadToFilesAPI(file: File, apiKey: string): Promise<string> {
-  const initRes = await fetch(
-    `https://generativelanguage.googleapis.com/upload/v1beta/files?key=${apiKey}`,
-    {
-      method: "POST",
-      headers: {
-        "X-Goog-Upload-Protocol": "resumable",
-        "X-Goog-Upload-Command": "start",
-        "X-Goog-Upload-Header-Content-Length": file.size.toString(),
-        "X-Goog-Upload-Header-Content-Type": "application/pdf",
-        "Content-Type": "application/json",
-      },
-      body: JSON.stringify({ file: { display_name: file.name } }),
+  const { action, ...payload } = req.body;
+
+  try {
+
+    // ── Action 1: Large PDF upload via Files API ──────────────────────────────
+    if (action === "uploadPdf") {
+      // Step 1 — initiate resumable upload
+      const initRes = await fetch(
+        `https://generativelanguage.googleapis.com/upload/v1beta/files?key=${apiKey}`,
+        {
+          method: "POST",
+          headers: {
+            "X-Goog-Upload-Protocol": "resumable",
+            "X-Goog-Upload-Command": "start",
+            "X-Goog-Upload-Header-Content-Length": payload.fileSize.toString(),
+            "X-Goog-Upload-Header-Content-Type": "application/pdf",
+            "Content-Type": "application/json",
+          },
+          body: JSON.stringify({ file: { display_name: payload.fileName } }),
+        }
+      );
+      if (!initRes.ok) throw new Error(`Files API init failed: ${initRes.status}`);
+      const uploadUrl = initRes.headers.get("X-Goog-Upload-URL");
+      if (!uploadUrl) throw new Error("No upload URL returned from Files API");
+
+      // Step 2 — upload the bytes
+      const fileBytes = Buffer.from(payload.fileBase64, "base64");
+      const uploadRes = await fetch(uploadUrl, {
+        method: "POST",
+        headers: {
+          "X-Goog-Upload-Command": "upload, finalize",
+          "X-Goog-Upload-Offset": "0",
+          "Content-Type": "application/pdf",
+        },
+        body: fileBytes,
+      });
+      if (!uploadRes.ok) throw new Error(`Files API upload failed: ${uploadRes.status}`);
+
+      const data = await uploadRes.json();
+      let uri   = data.file?.uri;
+      let state = data.file?.state;
+
+      // Step 3 — poll until processed
+      while (state === "PROCESSING") {
+        await new Promise(r => setTimeout(r, 1500));
+        const pollRes  = await fetch(
+          `https://generativelanguage.googleapis.com/v1beta/${data.file.name}?key=${apiKey}`
+        );
+        const pollData = await pollRes.json();
+        uri   = pollData.uri;
+        state = pollData.state;
+      }
+      if (state === "FAILED") throw new Error("Files API processing failed");
+
+      return res.status(200).json({ fileUri: uri });
     }
-  );
-  if (!initRes.ok) throw new Error(`Files API init failed: ${initRes.status}`);
-  const uploadUrl = initRes.headers.get("X-Goog-Upload-URL");
-  if (!uploadUrl) throw new Error("No upload URL returned from Files API");
 
-  const uploadRes = await fetch(uploadUrl, {
-    method: "POST",
-    headers: {
-      "X-Goog-Upload-Command": "upload, finalize",
-      "X-Goog-Upload-Offset": "0",
-      "Content-Type": "application/pdf",
-    },
-    body: file,
-  });
-  if (!uploadRes.ok) throw new Error(`Files API upload failed: ${uploadRes.status}`);
+    // ── Action 2: Run evaluation ──────────────────────────────────────────────
+    if (action === "evaluate") {
+      const userPromptText = `Evaluate the reliability of the following AI-generated response.
 
-  const data = await uploadRes.json();
-  let uri = data.file?.uri;
-  let state = data.file?.state;
-  while (state === "PROCESSING") {
-    await new Promise(r => setTimeout(r, 1500));
-    const pollRes = await fetch(
-      `https://generativelanguage.googleapis.com/v1beta/${data.file.name}?key=${apiKey}`
-    );
-    const pollData = await pollRes.json();
-    uri = pollData.uri;
-    state = pollData.state;
-  }
-  if (state === "FAILED") throw new Error("Files API processing failed");
-  return uri;
-}
-
-async function buildContextPart(contextInput: string, pdfFile: File | null, apiKey: string): Promise<any> {
-  if (!pdfFile) {
-    return { text: `Reference Context:\n${contextInput}` };
-  }
-
-  if (pdfFile.size > MAX_PDF_SIZE) {
-    throw new Error(`PDF is ${(pdfFile.size / 1024 / 1024).toFixed(1)} MB — maximum is 50 MB.`);
-  }
-
-  if (pdfFile.size <= INLINE_SIZE_LIMIT) {
-    const base64 = await fileToBase64(pdfFile);
-    return { inlineData: { mimeType: "application/pdf", data: base64 } };
-  } else {
-    const fileUri = await uploadToFilesAPI(pdfFile, apiKey);
-    return { fileData: { mimeType: "application/pdf", fileUri } };
-  }
-}
-
-export async function evaluateAIOutput(
-  query: string,
-  context: string,
-  output: string,
-  format: string,
-  domain: string = "general",
-  pdfFile: File | null = null,
-  onProgress?: (msg: string) => void
-): Promise<EvaluationResponse> {
-  const apiKey = "AIzaSyCLMsBcdjRLTTWIyDXpnp_Kve1QDzRDbnQ";
-  const ai = new GoogleGenAI({ apiKey });
-
-  if (pdfFile && onProgress) {
-    onProgress(pdfFile.size > INLINE_SIZE_LIMIT ? "Uploading PDF to Gemini Files API..." : "Processing PDF...");
-  }
-
-  const contextPart = await buildContextPart(context, pdfFile, apiKey);
-
-  const userPromptText = `Evaluate the reliability of the following AI-generated response.
-
-Original Query: ${query}
-Domain: ${domain}
-${!pdfFile ? "" : "[Reference context is provided as the attached PDF document above]"}
-Expected Output Format: ${format}
-AI Response: ${output}
+Original Query: ${payload.query}
+Domain: ${payload.domain}
+${payload.hasPdf ? "[Reference context is provided as the attached PDF document above]" : ""}
+Expected Output Format: ${payload.format}
+AI Response: ${payload.output}
 
 Return the result in the required JSON structure.`;
 
-  const response = await ai.models.generateContent({
-    model: "gemini-2.5-flash",
-    contents: {
-      parts: [
-        contextPart,
-        { text: userPromptText }
-      ]
-    },
-    config: {
-      systemInstruction: SYSTEM_INSTRUCTION,
-      responseMimeType: "application/json",
-      responseSchema: EVAL_SCHEMA as any,
-      temperature: 0.1,
-    },
-  });
+      const requestBody = {
+        system_instruction: { parts: [{ text: SYSTEM_INSTRUCTION }] },
+        contents: [{
+          parts: [
+            payload.contextPart,        // PDF or text context
+            { text: userPromptText },   // always last
+          ],
+        }],
+        generation_config: {
+          temperature: 0.1,
+          response_mime_type: "application/json",
+          max_output_tokens: 4096,
+        },
+      };
 
-  if (!response.text) {
-    throw new Error("Empty response from Gemini");
+      const geminiRes = await fetch(
+        `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key=${apiKey}`,
+        {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify(requestBody),
+        }
+      );
+
+      const data = await geminiRes.json();
+      if (!geminiRes.ok) {
+        throw new Error(data.error?.message || `Gemini error ${geminiRes.status}`);
+      }
+
+      const text = data.candidates?.[0]?.content?.parts
+        ?.map((p) => p.text || "").join("") || "";
+
+      const clean = text.replace(/```json|```/g, "").trim();
+      return res.status(200).json(JSON.parse(clean));
+    }
+
+    return res.status(400).json({ error: `Unknown action: ${action}` });
+
+  } catch (err) {
+    return res.status(500).json({ error: err.message });
   }
-
-  return JSON.parse(response.text) as EvaluationResponse;
 }
+```
+
+---
+
+## Checklist — Do These in Order
+```
+1. ☐  Regenerate your Gemini API key in AI Studio — the exposed one is compromised
+2. ☐  Replace the entire geminiService.ts with the rewritten version above
+3. ☐  Create api/gemini.js with the backend code above
+4. ☐  Add GEMINI_API_KEY to Vercel → Settings → Environment Variables (new key)
+5. ☐  Commit both files to GitHub
+6. ☐  Vercel auto-deploys — test one evaluation on the live URL
+7. ☐  Open DevTools → Network → confirm no API key visible in any request
