@@ -152,8 +152,3 @@ Return the result in the required JSON structure.`;
     return res.status(500).json({ error: err.message });
   }
 }
-```
-
-Commit with message:
-```
-fix: rebuild gemini proxy to handle action routing correctly
