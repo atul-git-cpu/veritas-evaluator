@@ -83,8 +83,4 @@ export async function evaluateAIOutput(
 
   return result as EvaluationResponse;
 }
-```
 
-**Step 4 — Scroll down, select "Commit directly to main branch" and commit with message:**
-```
-fix: replace geminiService.ts with clean proxy version
