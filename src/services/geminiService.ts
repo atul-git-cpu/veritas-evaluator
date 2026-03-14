@@ -148,16 +148,3 @@ Return the result in the required JSON structure.`;
     return res.status(500).json({ error: err.message });
   }
 }
-```
-
----
-
-## Checklist — Do These in Order
-```
-1. ☐  Regenerate your Gemini API key in AI Studio — the exposed one is compromised
-2. ☐  Replace the entire geminiService.ts with the rewritten version above
-3. ☐  Create api/gemini.js with the backend code above
-4. ☐  Add GEMINI_API_KEY to Vercel → Settings → Environment Variables (new key)
-5. ☐  Commit both files to GitHub
-6. ☐  Vercel auto-deploys — test one evaluation on the live URL
-7. ☐  Open DevTools → Network → confirm no API key visible in any request
